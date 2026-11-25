@@ -1,0 +1,203 @@
+# LinkStack v4.8.8 (self-hosted link-in-bio) in the do-tor1-k8s-glia1 cluster.
+# Reached at https://link.glia.org (Gandi A record -> ingress-nginx LB 159.203.50.191).
+#
+# Custom image: ghcr.io/gliax/linkstack:v4.8.8-ldap adds php83-ldap for LDAP login.
+# Local patches (LDAP login + page teams) live on the PVC and are re-applied with
+# linkstack-ldap/patches/apply.php after any LinkStack upgrade — see linkstack-ldap/README.md.
+#
+# Notes:
+#  * The image keeps the whole Laravel app + its SQLite DB (/htdocs/database/database.sqlite)
+#    inside /htdocs, so /htdocs is the persistent volume. K8s (unlike docker run) does not
+#    seed a fresh volume from the image, hence the "seed" initContainer, which copies the
+#    app in only when the volume is empty.
+#  * Image runs as apache (uid 100 / gid 101) and listens on 80. Binding a privileged port
+#    as non-root needs ip_unprivileged_port_start=0 (safe namespaced sysctl).
+#  * TLS terminates at the ingress and is forwarded over plain HTTP to the pod; the image's
+#    httpd.conf has no HTTP->HTTPS redirect, so no loop.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: linkstack
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: linkstack-data
+  namespace: linkstack
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: do-block-storage
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: linkstack
+  namespace: linkstack
+  labels:
+    app: linkstack
+spec:
+  replicas: 1
+  # RWO volume + SQLite: never run two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: linkstack
+  template:
+    metadata:
+      labels:
+        app: linkstack
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      initContainers:
+        - name: seed
+          image: ghcr.io/gliax/linkstack:v4.8.8-ldap
+          imagePullPolicy: IfNotPresent
+          # Runs as root only to copy the shipped app into an empty volume.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          command:
+            - sh
+            - -c
+            - |
+              # NB: a fresh DO block volume already contains lost+found, so test for the
+              # app itself rather than for emptiness.
+              if [ ! -f /target/artisan ]; then
+                echo "no app on volume: seeding from image"
+                cp -a /htdocs/. /target/
+              else
+                echo "app already present on volume: leaving as is"
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /target
+      containers:
+        - name: linkstack
+          image: ghcr.io/gliax/linkstack:v4.8.8-ldap
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+            - containerPort: 443
+              name: https
+          env:
+            - name: TZ
+              value: America/Toronto
+            - name: SERVER_ADMIN
+              value: admin@glia.org
+            - name: HTTP_SERVER_NAME
+              value: link.glia.org
+            - name: HTTPS_SERVER_NAME
+              value: link.glia.org
+            - name: PHP_MEMORY_LIMIT
+              value: 512M
+            - name: UPLOAD_MAX_FILESIZE
+              value: 16M
+            - name: LOG_LEVEL
+              value: info
+            - name: APP_URL
+              value: https://link.glia.org
+            # LDAP login (patched into LoginRequest; see linkstack-ldap/patches)
+            - name: LDAP_ENABLED
+              value: "true"
+            - name: LDAP_HOST
+              value: auth.glia.org
+            - name: LDAP_PORT
+              value: "636"
+            - name: LDAP_BASE_DN
+              value: dc=emlondon,dc=ca
+            - name: LDAP_TLS_VERIFY
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 768Mi
+          volumeMounts:
+            - name: data
+              mountPath: /htdocs
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: linkstack-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: linkstack
+  namespace: linkstack
+  labels:
+    app: linkstack
+spec:
+  selector:
+    app: linkstack
+  ports:
+    - name: https
+      port: 443
+      targetPort: https
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: linkstack
+  namespace: linkstack
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # LinkStack ignores X-Forwarded-Proto (TrustProxies is empty), so terminating TLS
+    # and forwarding plain HTTP makes it emit http:// asset/form URLs (mixed content).
+    # Talk HTTPS to the pod instead; Apache's self-signed cert is not verified.
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: link.glia.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: linkstack
+                port:
+                  number: 443
+  tls:
+    - hosts:
+        - link.glia.org
+      secretName: linkstack-glia-tls

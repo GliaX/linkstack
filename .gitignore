@@ -1,0 +1,8 @@
+# never commit credentials or local operator notes
+linkstack-credentials.md
+*credentials*.md
+*.local.md
+secrets/
+.env
+*.bak
+.DS_Store
